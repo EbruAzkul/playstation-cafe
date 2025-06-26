@@ -1,19 +1,40 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from django.utils import timezone
-from django.shortcuts import get_object_or_404
-from .models import Table, Session, PlayStationDevice
+from django.db.models import Sum
+from decimal import Decimal
+from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt
 from .serializers import (
     TableSerializer, SessionSerializer, SessionCreateSerializer,
-    PlayStationDeviceSerializer
+    PlayStationDeviceSerializer, CategorySerializer, ProductSerializer,
+    SessionProductSerializer, SessionProductCreateSerializer, ReceiptSerializer
 )
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
+
+class ProductViewSet(viewsets.ModelViewSet):
+    queryset = Product.objects.filter(is_active=True)
+    serializer_class = ProductSerializer
+    
+    @action(detail=False, methods=['get'])
+    def by_category(self, request):
+        """Kategorilere göre ürünleri listele"""
+        categories = Category.objects.prefetch_related('products').all()
+        result = []
+        for category in categories:
+            products = ProductSerializer(category.products.filter(is_active=True), many=True).data
+            result.append({
+                'category': CategorySerializer(category).data,
+                'products': products
+            })
+        return Response(result)
 
 class TableViewSet(viewsets.ModelViewSet):
     queryset = Table.objects.all()
     serializer_class = TableSerializer
-    # permission_classes = [IsAuthenticated]  # Geçici olarak kaldırıldı
     
     @action(detail=True, methods=['post'])
     def start_session(self, request, pk=None):
@@ -34,7 +55,7 @@ class TableViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Yeni seans oluştur (geçici olarak user_id=1)
+        # Yeni seans oluştur
         session = Session.objects.create(
             table=table,
             user_id=1,  # Varsayılan admin kullanıcısı
@@ -44,9 +65,6 @@ class TableViewSet(viewsets.ModelViewSet):
         # Masanın durumunu değiştir
         table.status = 'occupied'
         table.save()
-        
-        # PlayStation'ı aç (sonradan ekleyeceğiz)
-        # control_playstation(table.playstation_ip, 'on')
         
         return Response({
             'message': 'Seans başlatıldı',
@@ -68,53 +86,182 @@ class TableViewSet(viewsets.ModelViewSet):
         
         # Seansı sonlandır
         session.end_time = timezone.now()
-        session.calculate_total()
+        session.calculate_final_amounts()
         
         # Masanın durumunu değiştir
         table.status = 'available'
         table.save()
         
-        # PlayStation'ı kapat (sonradan ekleyeceğiz)
-        # control_playstation(table.playstation_ip, 'off')
-        
         return Response({
             'message': 'Seans sonlandırıldı',
             'session': SessionSerializer(session).data,
             'total_amount': float(session.total_amount),
+            'gaming_amount': float(session.gaming_amount),
+            'products_amount': float(session.products_amount),
             'duration_minutes': session.duration_minutes
         })
     
-    @action(detail=True, methods=['get'])
-    def current_session(self, request, pk=None):
-        """Masanın aktif seansını getir"""
+    @action(detail=True, methods=['post'])
+    def add_product(self, request, pk=None):
+        """Aktif seansa ürün ekle"""
         table = self.get_object()
         session = table.current_session
         
         if not session:
-            return Response({'session': None})
+            return Response(
+                {'error': 'Bu masada aktif seans yok'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        product_id = request.data.get('product_id')
+        quantity = int(request.data.get('quantity', 1))
+        
+        try:
+            product = Product.objects.get(id=product_id, is_active=True)
+        except Product.DoesNotExist:
+            return Response(
+                {'error': 'Geçersiz ürün'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Ürünü seansa ekle
+        session_product = SessionProduct.objects.create(
+            session=session,
+            product=product,
+            quantity=quantity
+        )
         
         return Response({
+            'message': f'{product.name} sepete eklendi',
+            'session_product': SessionProductSerializer(session_product).data,
             'session': SessionSerializer(session).data
         })
     
-    @action(detail=False, methods=['get'])
-    def available(self, request):
-        """Müsait masaları listele"""
-        tables = self.queryset.filter(status='available')
-        serializer = self.get_serializer(tables, many=True)
-        return Response(serializer.data)
+    @action(detail=True, methods=['post'])
+    def remove_product(self, request, pk=None):
+        """Aktif seanstan ürün çıkar"""
+        table = self.get_object()
+        session = table.current_session
+        
+        if not session:
+            return Response(
+                {'error': 'Bu masada aktif seans yok'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        session_product_id = request.data.get('session_product_id')
+        
+        try:
+            session_product = SessionProduct.objects.get(
+                id=session_product_id, 
+                session=session
+            )
+            product_name = session_product.product.name
+            session_product.delete()
+            
+            return Response({
+                'message': f'{product_name} sepetten çıkarıldı',
+                'session': SessionSerializer(session).data
+            })
+        except SessionProduct.DoesNotExist:
+            return Response(
+                {'error': 'Geçersiz ürün'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=True, methods=['post'])
+    def create_receipt(self, request, pk=None):
+        """Seans için fiş kes"""
+        table = self.get_object()
+        session = table.current_session
+        
+        if not session:
+            return Response(
+                {'error': 'Bu masada aktif seans yok'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Eğer seans bitmemişse bitir
+        if not session.end_time:
+            session.end_time = timezone.now()
+            session.calculate_final_amounts()
+        
+        # Fiş oluştur
+        receipt = Receipt.objects.create(
+            session=session,
+            issued_by_id=1  # Varsayılan admin kullanıcısı
+        )
+        
+        # Seansı ödendi olarak işaretle
+        session.is_paid = True
+        session.save()
+        
+        return Response({
+            'message': 'Fiş kesildi',
+            'receipt': ReceiptSerializer(receipt).data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def reset_table(self, request, pk=None):
+        """Masayı resetle"""
+        table = self.get_object()
+        
+        # Aktif seans varsa ve ödenmişse resetle
+        if table.current_session:
+            session = table.current_session
+            if not session.is_paid:
+                return Response(
+                    {'error': 'Seans henüz ödenmedi. Önce fiş kesin.'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            session.is_reset = True
+            session.save()
+        
+        # Masayı müsait yap
+        table.status = 'available'
+        table.save()
+        
+        return Response({
+            'message': 'Masa resetlendi',
+            'table': TableSerializer(table).data
+        })
     
     @action(detail=False, methods=['get'])
-    def occupied(self, request):
-        """Dolu masaları listele"""
-        tables = self.queryset.filter(status='occupied')
-        serializer = self.get_serializer(tables, many=True)
-        return Response(serializer.data)
+    def dashboard_stats(self, request):
+        """Dashboard için istatistikler"""
+        today = timezone.now().date()
+        
+        # Temel sayılar
+        total_tables = Table.objects.count()
+        available_tables = Table.objects.filter(status='available').count()
+        occupied_tables = Table.objects.filter(status='occupied').count()
+        active_sessions = Session.objects.filter(end_time__isnull=True).count()
+        
+        # Bugünkü gelir
+        today_sessions = Session.objects.filter(start_time__date=today)
+        today_revenue = today_sessions.filter(
+            end_time__isnull=False
+        ).aggregate(
+            total=Sum('total_amount')
+        )['total'] or Decimal('0')
+        
+        today_sessions_count = today_sessions.count()
+        
+        stats = {
+            'total_tables': total_tables,
+            'available_tables': available_tables,
+            'occupied_tables': occupied_tables,
+            'active_sessions': active_sessions,
+            'today_revenue': today_revenue,
+            'today_sessions': today_sessions_count
+        }
+        
+        return Response(stats)
 
 class SessionViewSet(viewsets.ModelViewSet):
     queryset = Session.objects.all()
     serializer_class = SessionSerializer
-    # permission_classes = [IsAuthenticated]  # Geçici olarak kaldırıldı
     
     def get_serializer_class(self):
         if self.action == 'create':
@@ -123,58 +270,20 @@ class SessionViewSet(viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         serializer.save(user_id=1)  # Varsayılan admin kullanıcısı
+
+class SessionProductViewSet(viewsets.ModelViewSet):
+    queryset = SessionProduct.objects.all()
+    serializer_class = SessionProductSerializer
     
-    @action(detail=False, methods=['get'])
-    def active(self, request):
-        """Aktif seansları listele"""
-        sessions = self.queryset.filter(end_time__isnull=True)
-        serializer = self.get_serializer(sessions, many=True)
-        return Response(serializer.data)
-    
-    @action(detail=False, methods=['get'])
-    def today(self, request):
-        """Bugünkü seansları listele"""
-        today = timezone.now().date()
-        sessions = self.queryset.filter(start_time__date=today)
-        serializer = self.get_serializer(sessions, many=True)
-        return Response(serializer.data)
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return SessionProductCreateSerializer
+        return SessionProductSerializer
+
+class ReceiptViewSet(viewsets.ModelViewSet):
+    queryset = Receipt.objects.all()
+    serializer_class = ReceiptSerializer
 
 class PlayStationDeviceViewSet(viewsets.ModelViewSet):
     queryset = PlayStationDevice.objects.all()
     serializer_class = PlayStationDeviceSerializer
-    # permission_classes = [IsAuthenticated]  # Geçici olarak kaldırıldı
-    
-    @action(detail=True, methods=['post'])
-    def power_on(self, request, pk=None):
-        """PlayStation'ı aç"""
-        device = self.get_object()
-        
-        # PlayStation kontrolü (sonradan ekleyeceğiz)
-        # success = control_playstation(device.table.playstation_ip, 'on')
-        
-        # Şimdilik mock response
-        device.is_online = True
-        device.last_seen = timezone.now()
-        device.save()
-        
-        return Response({
-            'message': f'{device.device_type} açıldı',
-            'device': self.get_serializer(device).data
-        })
-    
-    @action(detail=True, methods=['post'])
-    def power_off(self, request, pk=None):
-        """PlayStation'ı kapat"""
-        device = self.get_object()
-        
-        # PlayStation kontrolü (sonradan ekleyeceğiz)
-        # success = control_playstation(device.table.playstation_ip, 'off')
-        
-        # Şimdilik mock response
-        device.is_online = False
-        device.save()
-        
-        return Response({
-            'message': f'{device.device_type} kapatıldı',
-            'device': self.get_serializer(device).data
-        })
