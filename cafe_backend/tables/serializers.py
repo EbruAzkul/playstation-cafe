@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt
+from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt, StockMovement
 
 class CategorySerializer(serializers.ModelSerializer):
     product_count = serializers.SerializerMethodField()
@@ -13,10 +13,51 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class ProductSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
+    stock_status = serializers.CharField(read_only=True)
+    stock_status_display = serializers.CharField(read_only=True)
+    is_low_stock = serializers.BooleanField(read_only=True)
+    is_out_of_stock = serializers.BooleanField(read_only=True)
     
     class Meta:
         model = Product
-        fields = ['id', 'name', 'category', 'category_name', 'price', 'is_active', 'created_at']
+        fields = ['id', 'name', 'category', 'category_name', 'price', 'is_active', 
+                 'current_stock', 'min_stock_level', 'max_stock_level', 'stock_unit',
+                 'stock_status', 'stock_status_display', 'is_low_stock', 'is_out_of_stock',
+                 'created_at']
+
+class StockMovementSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    movement_type_display = serializers.CharField(source='get_movement_type_display', read_only=True)
+    
+    class Meta:
+        model = StockMovement
+        fields = ['id', 'product', 'product_name', 'movement_type', 'movement_type_display',
+                 'quantity', 'old_stock', 'new_stock', 'unit_cost', 'total_cost',
+                 'supplier', 'notes', 'created_by', 'created_by_name', 'created_at']
+
+class StockMovementCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockMovement
+        fields = ['product', 'movement_type', 'quantity', 'unit_cost', 'supplier', 'notes']
+    
+    def validate(self, data):
+        product = data['product']
+        quantity = data['quantity']
+        movement_type = data['movement_type']
+        
+        # Stok çıkışı kontrolü
+        if movement_type in ['out', 'waste'] and quantity > 0:
+            quantity = -quantity  # Çıkış için negatif yap
+            data['quantity'] = quantity
+        
+        # Yeterli stok kontrolü
+        if quantity < 0 and product.current_stock < abs(quantity):
+            raise serializers.ValidationError(
+                f'{product.name} için yeterli stok yok. Mevcut: {product.current_stock}, İstenen: {abs(quantity)}'
+            )
+        
+        return data
 
 class SessionProductSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
@@ -31,6 +72,22 @@ class SessionProductCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SessionProduct
         fields = ['product', 'quantity']
+    
+    def validate(self, data):
+        product = data['product']
+        quantity = data['quantity']
+        
+        # Stok kontrolü
+        if product.current_stock < quantity:
+            raise serializers.ValidationError(
+                f'{product.name} için yeterli stok yok. Mevcut: {product.current_stock}, İstenen: {quantity}'
+            )
+        
+        # Aktif ürün kontrolü
+        if not product.is_active:
+            raise serializers.ValidationError(f'{product.name} aktif değil.')
+        
+        return data
 
 class TableSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -53,7 +110,8 @@ class TableSerializer(serializers.ModelSerializer):
                 'products_amount': float(session.products_amount),
                 'total_amount': float(session.current_total_amount),
                 'user': session.user.username,
-                'is_paid': session.is_paid
+                'is_paid': session.is_paid,
+                'products': SessionProductSerializer(session.products.all(), many=True).data
             }
         return None
 
@@ -103,3 +161,49 @@ class DashboardStatsSerializer(serializers.Serializer):
     active_sessions = serializers.IntegerField()
     today_revenue = serializers.DecimalField(max_digits=10, decimal_places=2)
     today_sessions = serializers.IntegerField()
+    
+    # Stok istatistikleri
+    total_products = serializers.IntegerField()
+    low_stock_products = serializers.IntegerField()
+    out_of_stock_products = serializers.IntegerField()
+    total_stock_value = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+# Stok raporu için serializer
+class StockReportSerializer(serializers.Serializer):
+    category_name = serializers.CharField()
+    product_name = serializers.CharField()
+    current_stock = serializers.IntegerField()
+    min_stock_level = serializers.IntegerField()
+    stock_status = serializers.CharField()
+    unit_price = serializers.DecimalField(max_digits=6, decimal_places=2)
+    stock_value = serializers.DecimalField(max_digits=10, decimal_places=2)
+
+# Hızlı stok işlemleri için serializer
+class QuickStockUpdateSerializer(serializers.Serializer):
+    products = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField())
+    )
+    movement_type = serializers.ChoiceField(choices=StockMovement.MOVEMENT_TYPES)
+    supplier = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+    
+    def validate_products(self, value):
+        """Ürün listesi validasyonu"""
+        if not value:
+            raise serializers.ValidationError("En az bir ürün belirtilmelidir.")
+        
+        for item in value:
+            if 'product_id' not in item or 'quantity' not in item:
+                raise serializers.ValidationError("Her ürün için product_id ve quantity gereklidir.")
+            
+            try:
+                product_id = int(item['product_id'])
+                quantity = int(item['quantity'])
+            except (ValueError, TypeError):
+                raise serializers.ValidationError("Geçersiz ürün ID'si veya miktar.")
+            
+            # Ürün varlık kontrolü
+            if not Product.objects.filter(id=product_id, is_active=True).exists():
+                raise serializers.ValidationError(f"ID {product_id} ile ürün bulunamadı veya aktif değil.")
+        
+        return value

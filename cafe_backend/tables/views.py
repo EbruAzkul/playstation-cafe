@@ -2,13 +2,15 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Sum
+from django.db.models import Sum, F, Q
 from decimal import Decimal
-from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt
+from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt, StockMovement
 from .serializers import (
     TableSerializer, SessionSerializer, SessionCreateSerializer,
     PlayStationDeviceSerializer, CategorySerializer, ProductSerializer,
-    SessionProductSerializer, SessionProductCreateSerializer, ReceiptSerializer
+    SessionProductSerializer, SessionProductCreateSerializer, ReceiptSerializer,
+    StockMovementSerializer, StockMovementCreateSerializer, StockReportSerializer,
+    QuickStockUpdateSerializer
 )
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -31,6 +33,150 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'products': products
             })
         return Response(result)
+    
+    @action(detail=False, methods=['get'])
+    def stock_report(self, request):
+        """Stok raporu"""
+        products = Product.objects.filter(is_active=True).select_related('category')
+        
+        # Filtreleme
+        category_id = request.query_params.get('category')
+        stock_status = request.query_params.get('stock_status')
+        
+        if category_id:
+            products = products.filter(category_id=category_id)
+        
+        if stock_status == 'low':
+            products = products.filter(current_stock__lte=F('min_stock_level'))
+        elif stock_status == 'out':
+            products = products.filter(current_stock=0)
+        elif stock_status == 'normal':
+            products = products.filter(current_stock__gt=F('min_stock_level'))
+        
+        # Rapor verisi oluştur
+        report_data = []
+        for product in products:
+            report_data.append({
+                'category_name': product.category.name,
+                'product_name': product.name,
+                'current_stock': product.current_stock,
+                'min_stock_level': product.min_stock_level,
+                'stock_status': product.stock_status,
+                'unit_price': product.price,
+                'stock_value': product.current_stock * product.price
+            })
+        
+        return Response(report_data)
+    
+    @action(detail=False, methods=['get'])
+    def low_stock_alerts(self, request):
+        """Düşük stok uyarıları"""
+        low_stock_products = Product.objects.filter(
+            is_active=True,
+            current_stock__lte=F('min_stock_level')
+        ).select_related('category')
+        
+        alerts = []
+        for product in low_stock_products:
+            alerts.append({
+                'id': product.id,
+                'name': product.name,
+                'category': product.category.name,
+                'current_stock': product.current_stock,
+                'min_stock_level': product.min_stock_level,
+                'status': product.stock_status,
+                'urgency': 'critical' if product.is_out_of_stock else 'warning'
+            })
+        
+        return Response({
+            'total_alerts': len(alerts),
+            'critical_count': len([a for a in alerts if a['urgency'] == 'critical']),
+            'warning_count': len([a for a in alerts if a['urgency'] == 'warning']),
+            'alerts': alerts
+        })
+
+class StockMovementViewSet(viewsets.ModelViewSet):
+    queryset = StockMovement.objects.all()
+    serializer_class = StockMovementSerializer
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return StockMovementCreateSerializer
+        return StockMovementSerializer
+    
+    def perform_create(self, serializer):
+        """Stok hareketi oluştur ve ürün stokunu güncelle"""
+        movement = serializer.save(created_by=self.request.user)
+        
+        # Ürün stokunu güncelle
+        product = movement.product
+        movement.old_stock = product.current_stock
+        movement.new_stock = product.current_stock + movement.quantity
+        movement.save()
+        
+        product.current_stock = movement.new_stock
+        product.save()
+    
+    @action(detail=False, methods=['post'])
+    def bulk_update(self, request):
+        """Toplu stok güncellemesi"""
+        serializer = QuickStockUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        products_data = serializer.validated_data['products']
+        movement_type = serializer.validated_data['movement_type']
+        supplier = serializer.validated_data.get('supplier', '')
+        notes = serializer.validated_data.get('notes', '')
+        
+        created_movements = []
+        
+        for item in products_data:
+            product_id = int(item['product_id'])
+            quantity = int(item['quantity'])
+            unit_cost = item.get('unit_cost')
+            
+            product = Product.objects.get(id=product_id)
+            
+            # Çıkış hareketleri için negatif yap
+            if movement_type in ['out', 'waste', 'sale']:
+                quantity = -abs(quantity)
+            
+            # Stok hareketi oluştur
+            movement = StockMovement.objects.create(
+                product=product,
+                movement_type=movement_type,
+                quantity=quantity,
+                old_stock=product.current_stock,
+                new_stock=product.current_stock + quantity,
+                unit_cost=unit_cost,
+                supplier=supplier,
+                notes=notes,
+                created_by=request.user
+            )
+            
+            # Ürün stokunu güncelle
+            product.current_stock = movement.new_stock
+            product.save()
+            
+            created_movements.append(movement)
+        
+        return Response({
+            'message': f'{len(created_movements)} ürün için stok güncellendi',
+            'movements': StockMovementSerializer(created_movements, many=True).data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def product_history(self, request):
+        """Belirli bir ürünün stok geçmişi"""
+        product_id = request.query_params.get('product_id')
+        if not product_id:
+            return Response({'error': 'product_id parametresi gerekli'}, status=400)
+        
+        movements = StockMovement.objects.filter(
+            product_id=product_id
+        ).order_by('-created_at')[:50]  # Son 50 hareket
+        
+        return Response(StockMovementSerializer(movements, many=True).data)
 
 class TableViewSet(viewsets.ModelViewSet):
     queryset = Table.objects.all()
@@ -124,15 +270,29 @@ class TableViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Ürünü seansa ekle
-        session_product = SessionProduct.objects.create(
-            session=session,
-            product=product,
-            quantity=quantity
-        )
+        # Stok kontrolü
+        if product.current_stock < quantity:
+            return Response(
+                {'error': f'{product.name} için yeterli stok yok. Mevcut: {product.current_stock}'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Ürünü seansa ekle (stok otomatik azalacak)
+        try:
+            session_product = SessionProduct.objects.create(
+                session=session,
+                product=product,
+                quantity=quantity
+            )
+        except ValueError as e:
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
         return Response({
             'message': f'{product.name} sepete eklendi',
+            'product_name': product.name,
             'session_product': SessionProductSerializer(session_product).data,
             'session': SessionSerializer(session).data
         })
@@ -157,10 +317,11 @@ class TableViewSet(viewsets.ModelViewSet):
                 session=session
             )
             product_name = session_product.product.name
-            session_product.delete()
+            session_product.delete()  # Stok otomatik geri eklenecek
             
             return Response({
                 'message': f'{product_name} sepetten çıkarıldı',
+                'product_name': product_name,
                 'session': SessionSerializer(session).data
             })
         except SessionProduct.DoesNotExist:
@@ -198,7 +359,11 @@ class TableViewSet(viewsets.ModelViewSet):
         
         return Response({
             'message': 'Fiş kesildi',
-            'receipt': ReceiptSerializer(receipt).data
+            'receipt': ReceiptSerializer(receipt).data,
+            'table_name': table.name,
+            'user_name': session.user.username,
+            'start_time': session.start_time,
+            'end_time': session.end_time
         })
     
     @action(detail=True, methods=['post'])
@@ -248,13 +413,37 @@ class TableViewSet(viewsets.ModelViewSet):
         
         today_sessions_count = today_sessions.count()
         
+        # Stok istatistikleri
+        total_products = Product.objects.filter(is_active=True).count()
+        low_stock_products = Product.objects.filter(
+            is_active=True,
+            current_stock__lte=F('min_stock_level')
+        ).count()
+        out_of_stock_products = Product.objects.filter(
+            is_active=True,
+            current_stock=0
+        ).count()
+        
+        # Toplam stok değeri
+        total_stock_value = Product.objects.filter(
+            is_active=True
+        ).aggregate(
+            total=Sum(F('current_stock') * F('price'))
+        )['total'] or Decimal('0')
+        
         stats = {
             'total_tables': total_tables,
             'available_tables': available_tables,
             'occupied_tables': occupied_tables,
             'active_sessions': active_sessions,
             'today_revenue': today_revenue,
-            'today_sessions': today_sessions_count
+            'today_sessions': today_sessions_count,
+            
+            # Stok bilgileri
+            'total_products': total_products,
+            'low_stock_products': low_stock_products,
+            'out_of_stock_products': out_of_stock_products,
+            'total_stock_value': total_stock_value
         }
         
         return Response(stats)

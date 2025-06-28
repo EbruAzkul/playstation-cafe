@@ -55,6 +55,13 @@ class Product(models.Model):
     category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='products', verbose_name='Kategori')
     price = models.DecimalField(max_digits=6, decimal_places=2, verbose_name='Fiyat')
     is_active = models.BooleanField(default=True, verbose_name='Aktif')
+    
+    # Stok Takibi Alanları
+    current_stock = models.PositiveIntegerField(default=0, verbose_name='Mevcut Stok')
+    min_stock_level = models.PositiveIntegerField(default=5, verbose_name='Minimum Stok Seviyesi')
+    max_stock_level = models.PositiveIntegerField(default=100, verbose_name='Maksimum Stok Seviyesi')
+    stock_unit = models.CharField(max_length=20, default='adet', verbose_name='Stok Birimi')
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -64,7 +71,78 @@ class Product(models.Model):
         ordering = ['category__name', 'name']
     
     def __str__(self):
-        return f"{self.name} - ₺{self.price}"
+        return f"{self.name} - ₺{self.price} ({self.current_stock} {self.stock_unit})"
+    
+    @property
+    def is_low_stock(self):
+        """Stok seviyesi düşük mü?"""
+        return self.current_stock <= self.min_stock_level
+    
+    @property
+    def is_out_of_stock(self):
+        """Stok tükendi mi?"""
+        return self.current_stock <= 0
+    
+    @property
+    def stock_status(self):
+        """Stok durumu"""
+        if self.is_out_of_stock:
+            return 'out_of_stock'
+        elif self.is_low_stock:
+            return 'low_stock'
+        else:
+            return 'in_stock'
+    
+    @property
+    def stock_status_display(self):
+        """Stok durumu açıklaması"""
+        if self.is_out_of_stock:
+            return 'Stok Tükendi'
+        elif self.is_low_stock:
+            return 'Stok Azalıyor'
+        else:
+            return 'Stok Yeterli'
+
+class StockMovement(models.Model):
+    """Stok hareketleri (giriş/çıkış takibi)"""
+    MOVEMENT_TYPES = [
+        ('in', 'Stok Girişi'),
+        ('out', 'Stok Çıkışı'),
+        ('sale', 'Satış'),
+        ('waste', 'Fire/İmha'),
+        ('adjustment', 'Düzeltme'),
+    ]
+    
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='stock_movements', verbose_name='Ürün')
+    movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES, verbose_name='Hareket Tipi')
+    quantity = models.IntegerField(verbose_name='Miktar')  # Pozitif: giriş, Negatif: çıkış
+    old_stock = models.PositiveIntegerField(verbose_name='Önceki Stok')
+    new_stock = models.PositiveIntegerField(verbose_name='Yeni Stok')
+    unit_cost = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, verbose_name='Birim Maliyet')
+    total_cost = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True, verbose_name='Toplam Maliyet')
+    supplier = models.CharField(max_length=100, blank=True, verbose_name='Tedarikçi')
+    notes = models.TextField(blank=True, verbose_name='Notlar')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='Oluşturan')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Oluşturma Zamanı')
+    
+    # Satış hareketi için referans
+    session_product = models.ForeignKey('SessionProduct', null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_movement', verbose_name='Seans Ürünü')
+    
+    class Meta:
+        verbose_name = 'Stok Hareketi'
+        verbose_name_plural = 'Stok Hareketleri'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        sign = '+' if self.quantity > 0 else ''
+        return f"{self.product.name} - {sign}{self.quantity} {self.product.stock_unit} ({self.get_movement_type_display()})"
+    
+    def save(self, *args, **kwargs):
+        # Toplam maliyeti hesapla
+        if self.unit_cost and self.quantity > 0:
+            self.total_cost = self.unit_cost * self.quantity
+        
+        super().save(*args, **kwargs)
 
 class Session(models.Model):
     """Oyun seansı modeli"""
@@ -149,19 +227,76 @@ class SessionProduct(models.Model):
         # İlk kayıt sırasında fiyatları al
         if not self.pk:
             self.unit_price = self.product.price
+            
+            # Stok kontrolü
+            if self.product.current_stock < self.quantity:
+                raise ValueError(f'{self.product.name} için yeterli stok yok. Mevcut: {self.product.current_stock}, İstenen: {self.quantity}')
         
         # Toplam fiyatı hesapla
         self.total_price = self.unit_price * self.quantity
         
         super().save(*args, **kwargs)
         
+        # İlk kayıtsa stok hareketi oluştur
+        if not self.pk or not hasattr(self, '_stock_updated'):
+            self.update_stock()
+        
         # Session'ın ürün tutarını güncelle
         self.update_session_products_amount()
     
     def delete(self, *args, **kwargs):
+        # Stoku geri ekle
+        self.restore_stock()
+        
         session = self.session
         super().delete(*args, **kwargs)
         self.update_session_products_amount_for_session(session)
+    
+    def update_stock(self):
+        """Ürün satıldığında stoktan düş"""
+        product = self.product
+        old_stock = product.current_stock
+        new_stock = old_stock - self.quantity
+        
+        # Stok hareketi oluştur
+        StockMovement.objects.create(
+            product=product,
+            movement_type='sale',
+            quantity=-self.quantity,  # Negatif çünkü çıkış
+            old_stock=old_stock,
+            new_stock=new_stock,
+            created_by_id=1,  # Varsayılan admin
+            session_product=self,
+            notes=f'Satış: {self.session.table.name} - Seans #{self.session.id}'
+        )
+        
+        # Ürün stokunu güncelle
+        product.current_stock = new_stock
+        product.save()
+        
+        self._stock_updated = True
+    
+    def restore_stock(self):
+        """Ürün iptal edildiğinde stoku geri ekle"""
+        if hasattr(self, 'stock_movement') and self.stock_movement:
+            product = self.product
+            old_stock = product.current_stock
+            new_stock = old_stock + self.quantity
+            
+            # Ters stok hareketi oluştur
+            StockMovement.objects.create(
+                product=product,
+                movement_type='adjustment',
+                quantity=self.quantity,  # Pozitif çünkü giriş
+                old_stock=old_stock,
+                new_stock=new_stock,
+                created_by_id=1,  # Varsayılan admin
+                notes=f'İptal: {self.session.table.name} - Seans #{self.session.id}'
+            )
+            
+            # Ürün stokunu güncelle
+            product.current_stock = new_stock
+            product.save()
     
     def update_session_products_amount(self):
         """Bu seanstaki tüm ürünlerin toplam tutarını güncelle"""

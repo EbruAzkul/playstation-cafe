@@ -11,6 +11,7 @@ const Dashboard = () => {
   const [notes, setNotes] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('');
   const [currentSession, setCurrentSession] = useState(null);
+  const [receiptData, setReceiptData] = useState(null); // Fiş detayları için
 
   const API_BASE_URL = 'http://127.0.0.1:8000/api';
 
@@ -58,6 +59,7 @@ const Dashboard = () => {
   const openDialog = (type, tableId = null) => {
     setDialog({ open: true, type, tableId });
     setNotes('');
+    setReceiptData(null);
     
     if (type === 'products' && tableId) {
       const table = tables.find(t => t.id === tableId);
@@ -72,6 +74,7 @@ const Dashboard = () => {
     setDialog({ open: false, type: '', tableId: null });
     setNotes('');
     setCurrentSession(null);
+    setReceiptData(null);
   };
 
   const apiCall = async (url, method = 'GET', body = null) => {
@@ -95,7 +98,8 @@ const Dashboard = () => {
 
   const startSession = async () => {
     try {
-      await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/start_session/`, 'POST', { notes });
+      // eslint-disable-next-line no-unused-vars
+      const response = await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/start_session/`, 'POST', { notes });
       showSnackbar('Seans başlatıldı!');
       await loadData();
       closeDialog();
@@ -104,10 +108,11 @@ const Dashboard = () => {
     }
   };
 
+  // Sadece seansı durdurur, fiş kesmez
   const stopSession = async () => {
     try {
       const response = await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/stop_session/`, 'POST');
-      showSnackbar(`Seans sonlandırıldı! Toplam: ₺${response.total_amount}`);
+      showSnackbar(`Seans durduruldu! Toplam süre: ${formatDuration({ duration_minutes: response.duration_minutes })}`);
       await loadData();
       closeDialog();
     } catch (error) {
@@ -117,28 +122,62 @@ const Dashboard = () => {
 
   const addProduct = async (productId) => {
     try {
-      await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/add_product/`, 'POST', {
+      // Önce ürün adını bul
+      let productName = 'Ürün';
+      categories.forEach(cat => {
+        cat.products.forEach(product => {
+          if (product.id === productId) {
+            productName = product.name;
+          }
+        });
+      });
+
+      console.log('🛒 Ürün ekleniyor:', productName, 'ID:', productId, 'Masa:', dialog.tableId);
+
+      // eslint-disable-next-line no-unused-vars
+      const response = await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/add_product/`, 'POST', {
         product_id: productId,
         quantity: 1
       });
-      showSnackbar('Ürün eklendi');
+      
+      console.log('🛒 Add product response:', response);
+      
+      // Eklenen ürün bilgisini göster
+      showSnackbar(`${productName} eklendi!`);
+      
+      console.log('🔄 Loading data after product add...');
       await loadData();
       
       const updatedTable = tables.find(t => t.id === dialog.tableId);
+      console.log('🔄 Updated table after loadData:', updatedTable);
+      
       if (updatedTable?.current_session) {
         setCurrentSession(updatedTable.current_session);
+        console.log('🔄 Updated current session:', updatedTable.current_session);
       }
     } catch (error) {
+      console.error('❌ Add product error:', error);
       showSnackbar(error.message, 'error');
     }
   };
 
   const removeProduct = async (sessionProductId) => {
     try {
-      await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/remove_product/`, 'POST', {
+      // Önce ürün adını bul
+      let productName = 'Ürün';
+      if (currentSession && currentSession.products) {
+        const sessionProduct = currentSession.products.find(p => p.id === sessionProductId);
+        if (sessionProduct) {
+          productName = sessionProduct.product_name;
+        }
+      }
+
+      // eslint-disable-next-line no-unused-vars
+      const response = await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/remove_product/`, 'POST', {
         session_product_id: sessionProductId
       });
-      showSnackbar('Ürün çıkarıldı');
+      
+      showSnackbar(`${productName} çıkarıldı`);
       await loadData();
       
       const updatedTable = tables.find(t => t.id === dialog.tableId);
@@ -153,13 +192,17 @@ const Dashboard = () => {
   const createReceipt = async () => {
     try {
       const response = await apiCall(`${API_BASE_URL}/tables/${dialog.tableId}/create_receipt/`, 'POST');
-      showSnackbar(`Fiş kesildi: ${response.receipt.receipt_number}`);
-      await loadData();
-      closeDialog();
       
-      setTimeout(() => {
-        openDialog('reset', dialog.tableId);
-      }, 1000);
+      // Debug: Backend'den gelen veriyi console'a yazdır
+      console.log('🧾 Backend Response:', response);
+      console.log('🧾 Receipt Data:', JSON.stringify(response, null, 2));
+      
+      // Fiş detaylarını göster
+      setReceiptData(response);
+      setDialog({ open: true, type: 'receipt_details', tableId: dialog.tableId });
+      
+      showSnackbar(`Fiş kesildi: ${response.receipt?.receipt_number || response.receipt_number || 'N/A'}`);
+      await loadData();
     } catch (error) {
       showSnackbar(error.message, 'error');
     }
@@ -177,12 +220,26 @@ const Dashboard = () => {
   };
 
   const formatAmount = (amount) => {
-    return `₺${parseFloat(amount || 0).toFixed(2)}`;
+    // String'i sayıya çevir, NaN ise 0 kullan
+    const numAmount = parseFloat(amount) || 0;
+    return `₺${numAmount.toFixed(2)}`;
   };
 
   const getProductCount = (session) => {
-    if (!session || !session.products) return 0;
-    return session.products.reduce((total, product) => total + product.quantity, 0);
+    console.log('🔍 getProductCount called with session:', session);
+    
+    if (!session || !session.products) {
+      console.log('🔍 No session or no products, returning 0');
+      return 0;
+    }
+    
+    const count = session.products.reduce((total, product) => {
+      console.log('🔍 Product:', product.product_name, 'Quantity:', product.quantity);
+      return total + product.quantity;
+    }, 0);
+    
+    console.log('🔍 Total product count:', count);
+    return count;
   };
 
   const formatDuration = (session) => {
@@ -196,11 +253,23 @@ const Dashboard = () => {
     return `${session.duration_minutes}dk`;
   };
 
+  const formatDateTime = (dateTimeString) => {
+    if (!dateTimeString) return '';
+    const date = new Date(dateTimeString);
+    return date.toLocaleString('tr-TR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loading) {
     return (
@@ -481,6 +550,19 @@ const Dashboard = () => {
                     marginBottom: '0.5rem'
                   }}>
                     🎮 Aktif Seans
+                  </div>
+                  
+                  {/* Debug: Session bilgilerini göster */}
+                  <div style={{
+                    fontSize: '0.7rem',
+                    backgroundColor: '#f3f4f6',
+                    padding: '0.5rem',
+                    borderRadius: '0.25rem',
+                    marginBottom: '0.5rem',
+                    fontFamily: 'monospace'
+                  }}>
+                    Debug: Products: {table.current_session.products ? table.current_session.products.length : 'null'} | 
+                    Count: {getProductCount(table.current_session)}
                   </div>
                   
                   <div style={{
@@ -785,7 +867,7 @@ const Dashboard = () => {
             width: '90%'
           }}>
             <h3 style={{ margin: '0 0 1rem 0', fontSize: '1.25rem', fontWeight: 'bold' }}>
-              ⏹️ Seansı Sonlandır
+              ⏹️ Seansı Durdur
             </h3>
             <div style={{
               backgroundColor: '#fef3c7',
@@ -795,12 +877,13 @@ const Dashboard = () => {
               borderRadius: '0.5rem',
               marginBottom: '1rem'
             }}>
-              Bu seansı sonlandırmak istediğinizden emin misiniz?
+              Bu seansı durdurmak istediğinizden emin misiniz?
             </div>
             <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 1rem 0' }}>
-              <li>• Otomatik olarak ücret hesaplanacak</li>
+              <li>• Seans duraklatılacak</li>
               <li>• PlayStation kapatılacak</li>
-              <li>• Seans tamamlandı olarak işaretlenecek</li>
+              <li>• Masa müsait duruma geçecek</li>
+              <li>• Fiş kesilmeyecek (daha sonra fiş kesebilirsiniz)</li>
             </ul>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
               <button
@@ -813,345 +896,628 @@ const Dashboard = () => {
                 }}
                 onClick={closeDialog}
               >
-                İptal</button>
-             <button
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: 'none',
-                 borderRadius: '0.5rem',
-                 backgroundColor: '#ef4444',
-                 color: 'white',
-                 cursor: 'pointer'
-               }}
-               onClick={stopSession}
-             >
-               Seansı Sonlandır
-             </button>
-           </div>
-         </div>
-       </div>
-     )}
+                İptal
+              </button>
+              <button
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: 'none',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#ef4444',
+                  color: 'white',
+                  cursor: 'pointer'
+                }}
+                onClick={stopSession}
+              >
+                Seansı Durdur
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
-     {/* Ürün Yönetimi Dialog */}
-     {dialog.open && dialog.type === 'products' && (
-       <div style={{
-         position: 'fixed',
-         top: 0,
-         left: 0,
-         right: 0,
-         bottom: 0,
-         backgroundColor: 'rgba(0,0,0,0.5)',
-         display: 'flex',
-         alignItems: 'center',
-         justifyContent: 'center',
-         zIndex: 1000
-       }}>
-         <div style={{
-           backgroundColor: 'white',
-           borderRadius: '0.75rem',
-           padding: '2rem',
-           maxWidth: '800px',
-           width: '90%',
-           maxHeight: '90vh',
-           overflow: 'auto'
-         }}>
-           <div style={{
-             display: 'flex',
-             justifyContent: 'space-between',
-             alignItems: 'center',
-             marginBottom: '1.5rem'
-           }}>
-             <h3 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 'bold' }}>
-               🛒 Ürün Yönetimi
-             </h3>
-             <span style={{
-               backgroundColor: '#dbeafe',
-               color: '#1e40af',
-               padding: '0.5rem 1rem',
-               borderRadius: '1rem',
-               fontSize: '0.875rem'
-             }}>
-               {getProductCount(currentSession)} Ürün
-             </span>
-           </div>
+      {/* Ürün Yönetimi Dialog */}
+      {dialog.open && dialog.type === 'products' && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '0.75rem',
+            padding: '2rem',
+            maxWidth: '800px',
+            width: '90%',
+            maxHeight: '90vh',
+            overflow: 'auto'
+          }}>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '1.5rem'
+            }}>
+              <h3 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 'bold' }}>
+                🛒 Ürün Yönetimi
+              </h3>
+              <span style={{
+                backgroundColor: '#dbeafe',
+                color: '#1e40af',
+                padding: '0.5rem 1rem',
+                borderRadius: '1rem',
+                fontSize: '0.875rem'
+              }}>
+                {getProductCount(currentSession)} Ürün
+              </span>
+            </div>
 
-           <div style={{
-             display: 'grid',
-             gridTemplateColumns: '1fr 1fr',
-             gap: '2rem'
-           }}>
-             {/* Kategoriler */}
-             <div>
-               <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Kategoriler</h4>
-               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                 {categories.map((cat) => (
-                   <button
-                     key={cat.category.id}
-                     onClick={() => setSelectedCategory(cat.category.name)}
-                     style={{
-                       padding: '1rem',
-                       border: '1px solid #d1d5db',
-                       borderRadius: '0.5rem',
-                       backgroundColor: selectedCategory === cat.category.name ? '#dbeafe' : '#f9fafb',
-                       cursor: 'pointer',
-                       textAlign: 'left',
-                       fontWeight: selectedCategory === cat.category.name ? 'bold' : 'normal',
-                       color: selectedCategory === cat.category.name ? '#1e40af' : '#374151'
-                     }}
-                   >
-                     {cat.category.name}
-                   </button>
-                 ))}
-               </div>
-             </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '2rem'
+            }}>
+              {/* Kategoriler */}
+              <div>
+                <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Kategoriler</h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  {categories.map((cat) => (
+                    <button
+                      key={cat.category.id}
+                      onClick={() => setSelectedCategory(cat.category.name)}
+                      style={{
+                        padding: '1rem',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '0.5rem',
+                        backgroundColor: selectedCategory === cat.category.name ? '#dbeafe' : '#f9fafb',
+                        cursor: 'pointer',
+                        textAlign: 'left',
+                        fontWeight: selectedCategory === cat.category.name ? 'bold' : 'normal',
+                        color: selectedCategory === cat.category.name ? '#1e40af' : '#374151'
+                      }}
+                    >
+                      {cat.category.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-             {/* Ürünler */}
-             <div>
-               <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Ürünler</h4>
-               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                 {categories
-                   .filter((cat) => cat.category.name === selectedCategory)
-                   .flatMap((cat) => cat.products)
-                   .map((product) => (
-                     <div
-                       key={product.id}
-                       style={{
-                         display: 'flex',
-                         justifyContent: 'space-between',
-                         alignItems: 'center',
-                         padding: '1rem',
-                         border: '1px solid #e5e7eb',
-                         borderRadius: '0.5rem',
-                         backgroundColor: '#f9fafb'
-                       }}
-                     >
-                       <div>
-                         <div style={{ fontWeight: 'bold' }}>{product.name}</div>
-                         <div style={{ fontSize: '0.875rem', color: '#6b7280' }}>
-                           {formatAmount(product.price)}
-                         </div>
-                       </div>
-                       <button
-                         onClick={() => addProduct(product.id)}
-                         style={{
-                           backgroundColor: '#10b981',
-                           color: 'white',
-                           border: 'none',
-                           padding: '0.5rem 1rem',
-                           borderRadius: '0.25rem',
-                           cursor: 'pointer',
-                           fontWeight: 'bold'
-                         }}
-                       >
-                         +
-                       </button>
-                     </div>
-                   ))}
-               </div>
-             </div>
-           </div>
+              {/* Ürünler */}
+              <div>
+                <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Ürünler</h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  {categories
+                    .filter((cat) => cat.category.name === selectedCategory)
+                    .flatMap((cat) => cat.products)
+                    .map((product) => (
+                      <div
+                        key={product.id}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          padding: '1rem',
+                          border: '1px solid #e5e7eb',
+                          borderRadius: '0.5rem',
+                          backgroundColor: '#f9fafb'
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontWeight: 'bold' }}>{product.name}</div>
+                          <div style={{ fontSize: '0.875rem', color: '#6b7280' }}>
+                            {formatAmount(product.price)}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => addProduct(product.id)}
+                          style={{
+                            backgroundColor: '#10b981',
+                            color: 'white',
+                            border: 'none',
+                            padding: '0.5rem 1rem',
+                            borderRadius: '0.25rem',
+                            cursor: 'pointer',
+                            fontWeight: 'bold'
+                          }}
+                        >
+                          +
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            </div>
 
-           {/* Sepet */}
-           <div style={{ marginTop: '2rem' }}>
-             <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Sepet</h4>
-             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-               {currentSession?.products?.map((item) => (
-                 <div
-                   key={item.id}
-                   style={{
-                     display: 'flex',
-                     justifyContent: 'space-between',
-                     alignItems: 'center',
-                     padding: '1rem',
-                     backgroundColor: '#f3f4f6',
-                     borderRadius: '0.5rem'
-                   }}
-                 >
-                   <div>
-                     <div style={{ fontWeight: 'bold' }}>{item.product_name}</div>
-                     <div style={{ fontSize: '0.875rem', color: '#6b7280' }}>
-                       {item.quantity} x ₺{item.unit_price.toFixed(2)} = ₺{item.total_price.toFixed(2)}
-                     </div>
-                   </div>
-                   <button
-                     onClick={() => removeProduct(item.id)}
-                     style={{
-                       backgroundColor: '#ef4444',
-                       color: 'white',
-                       border: 'none',
-                       padding: '0.5rem 1rem',
-                       borderRadius: '0.25rem',
-                       cursor: 'pointer',
-                       fontWeight: 'bold'
-                     }}
-                   >
-                     -
-                   </button>
-                 </div>
-               ))}
-               {(!currentSession?.products || currentSession.products.length === 0) && (
-                 <div style={{
-                   textAlign: 'center',
-                   padding: '2rem',
-                   color: '#6b7280'
-                 }}>
-                   Sepet boş - Ürün eklemek için kategorilerden seçim yapın
-                 </div>
-               )}
-             </div>
-           </div>
+            {/* Sepet */}
+            <div style={{ marginTop: '2rem' }}>
+              <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold' }}>Sepet</h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {currentSession?.products?.map((item) => (
+                  <div
+                    key={item.id}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '1rem',
+                      backgroundColor: '#f3f4f6',
+                      borderRadius: '0.5rem'
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontWeight: 'bold' }}>{item.product_name}</div>
+                      <div style={{ fontSize: '0.875rem', color: '#6b7280' }}>
+                        {item.quantity} x ₺{parseFloat(item.unit_price || 0).toFixed(2)} = ₺{parseFloat(item.total_price || 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => removeProduct(item.id)}
+                      style={{
+                        backgroundColor: '#ef4444',
+                        color: 'white',
+                        border: 'none',
+                        padding: '0.5rem 1rem',
+                        borderRadius: '0.25rem',
+                        cursor: 'pointer',
+                        fontWeight: 'bold'
+                      }}
+                    >
+                      -
+                    </button>
+                  </div>
+                ))}
+                {(!currentSession?.products || currentSession.products.length === 0) && (
+                  <div style={{
+                    textAlign: 'center',
+                    padding: '2rem',
+                    color: '#6b7280'
+                  }}>
+                    Sepet boş - Ürün eklemek için kategorilerden seçim yapın
+                  </div>
+                )}
+              </div>
+            </div>
 
-           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '2rem' }}>
-             <button
-               onClick={closeDialog}
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: 'none',
-                 borderRadius: '0.5rem',
-                 backgroundColor: '#3b82f6',
-                 color: 'white',
-                 cursor: 'pointer'
-               }}
-             >
-               Kapat
-             </button>
-           </div>
-         </div>
-       </div>
-     )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '2rem' }}>
+              <button
+                onClick={closeDialog}
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: 'none',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#3b82f6',
+                  color: 'white',
+                  cursor: 'pointer'
+                }}
+              >
+                Kapat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
-     {/* Fiş Kes Dialog */}
-     {dialog.open && dialog.type === 'receipt' && (
-       <div style={{
-         position: 'fixed',
-         top: 0,
-         left: 0,
-         right: 0,
-         bottom: 0,
-         backgroundColor: 'rgba(0,0,0,0.5)',
-         display: 'flex',
-         alignItems: 'center',
-         justifyContent: 'center',
-         zIndex: 1000
-       }}>
-         <div style={{
-           backgroundColor: 'white',
-           borderRadius: '0.75rem',
-           padding: '2rem',
-           maxWidth: '500px',
-           width: '90%'
-         }}>
-           <h3 style={{ margin: '0 0 1rem 0', fontSize: '1.25rem', fontWeight: 'bold' }}>
-             Fiş Kes ve Tahsil Et
-           </h3>
-           <div style={{
-             backgroundColor: '#dbeafe',
-             border: '1px solid #3b82f6',
-             color: '#1e40af',
-             padding: '1rem',
-             borderRadius: '0.5rem',
-             marginBottom: '1rem'
-           }}>
-             Bu işlem sonunda fiş kesilecek ve masa tahsil edilerek kapatılacaktır.
-           </div>
-           <p style={{ margin: '0 0 1rem 0' }}>Bu işlemi yapmak istediğinizden emin misiniz?</p>
-           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
-             <button
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: '1px solid #d1d5db',
-                 borderRadius: '0.5rem',
-                 backgroundColor: 'white',
-                 cursor: 'pointer'
-               }}
-               onClick={closeDialog}
-             >
-               İptal
-             </button>
-             <button
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: 'none',
-                 borderRadius: '0.5rem',
-                 backgroundColor: '#8b5cf6',
-                 color: 'white',
-                 cursor: 'pointer'
-               }}
-               onClick={createReceipt}
-             >
-               Fiş Kes
-             </button>
-           </div>
-         </div>
-       </div>
-     )}
+      {/* Fiş Kes Dialog */}
+      {dialog.open && dialog.type === 'receipt' && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '0.75rem',
+            padding: '2rem',
+            maxWidth: '500px',
+            width: '90%'
+          }}>
+            <h3 style={{ margin: '0 0 1rem 0', fontSize: '1.25rem', fontWeight: 'bold' }}>
+              🧾 Fiş Kes ve Tahsil Et
+            </h3>
+            <div style={{
+              backgroundColor: '#dbeafe',
+              border: '1px solid #3b82f6',
+              color: '#1e40af',
+              padding: '1rem',
+              borderRadius: '0.5rem',
+              marginBottom: '1rem'
+            }}>
+              Bu işlem sonunda fiş kesilecek ve masa tahsil edilerek kapatılacaktır.
+            </div>
+            <p style={{ margin: '0 0 1rem 0' }}>Bu işlemi yapmak istediğinizden emin misiniz?</p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
+              <button
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '0.5rem',
+                  backgroundColor: 'white',
+                  cursor: 'pointer'
+                }}
+                onClick={closeDialog}
+              >
+                İptal
+              </button>
+              <button
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: 'none',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#8b5cf6',
+                  color: 'white',
+                  cursor: 'pointer'
+                }}
+                onClick={createReceipt}
+              >
+                Fiş Kes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
-     {/* Reset Dialog */}
-     {dialog.open && dialog.type === 'reset' && (
-       <div style={{
-         position: 'fixed',
-         top: 0,
-         left: 0,
-         right: 0,
-         bottom: 0,
-         backgroundColor: 'rgba(0,0,0,0.5)',
-         display: 'flex',
-         alignItems: 'center',
-         justifyContent: 'center',
-         zIndex: 1000
-       }}>
-         <div style={{
-           backgroundColor: 'white',
-           borderRadius: '0.75rem',
-           padding: '2rem',
-           maxWidth: '500px',
-           width: '90%'
-         }}>
-           <h3 style={{ margin: '0 0 1rem 0', fontSize: '1.25rem', fontWeight: 'bold' }}>
-             Masa Resetle
-           </h3>
-           <div style={{
-             backgroundColor: '#fef3c7',
-             border: '1px solid #f59e0b',
-             color: '#92400e',
-             padding: '1rem',
-             borderRadius: '0.5rem',
-             marginBottom: '1rem'
-           }}>
-             Bu işlem masayı tamamen sıfırlar. Emin misiniz?
-           </div>
-           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
-             <button
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: '1px solid #d1d5db',
-                 borderRadius: '0.5rem',
-                 backgroundColor: 'white',
-                 cursor: 'pointer'
-               }}
-               onClick={closeDialog}
-             >
-               İptal
-             </button>
-             <button
-               style={{
-                 padding: '0.5rem 1rem',
-                 border: 'none',
-                 borderRadius: '0.5rem',
-                 backgroundColor: '#ef4444',
-                 color: 'white',
-                 cursor: 'pointer'
-               }}
-               onClick={resetTable}
-             >
-               Resetle
-             </button>
-           </div>
-         </div>
-       </div>
-     )}
-   </div>
- );
+      {/* Fiş Detayları Dialog */}
+      {dialog.open && dialog.type === 'receipt_details' && receiptData && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '0.75rem',
+            padding: '2rem',
+            maxWidth: '600px',
+            width: '90%',
+            maxHeight: '90vh',
+            overflow: 'auto'
+          }}>
+            {/* Fiş Başlığı */}
+            <div style={{
+              textAlign: 'center',
+              borderBottom: '2px solid #e5e7eb',
+              paddingBottom: '1rem',
+              marginBottom: '1.5rem'
+            }}>
+              <h2 style={{ margin: '0 0 0.5rem 0', fontSize: '1.5rem', fontWeight: 'bold' }}>
+                🧾 FİŞ DETAYLARI
+              </h2>
+              <div style={{ fontSize: '1.125rem', fontWeight: 'bold', color: '#3b82f6' }}>
+                Fiş No: {receiptData.receipt?.receipt_number || 'N/A'}
+              </div>
+              <div style={{ fontSize: '0.875rem', color: '#6b7280', marginTop: '0.25rem' }}>
+                {formatDateTime(receiptData.end_time || new Date())}
+              </div>
+            </div>
+
+            {/* Masa ve Seans Bilgileri */}
+            <div style={{
+              backgroundColor: '#f8fafc',
+              padding: '1rem',
+              borderRadius: '0.5rem',
+              marginBottom: '1.5rem'
+            }}>
+              <h4 style={{ margin: '0 0 0.5rem 0', fontWeight: 'bold', color: '#374151' }}>
+                📅 Seans Bilgileri
+              </h4>
+              <div style={{ fontSize: '0.875rem', lineHeight: '1.6' }}>
+                <div><strong>Masa:</strong> {receiptData.table_name || 'Masa'}</div>
+                <div><strong>Müşteri:</strong> {receiptData.user_name || 'Müşteri'}</div>
+                <div><strong>Başlangıç:</strong> {formatDateTime(receiptData.start_time)}</div>
+                <div><strong>Bitiş:</strong> {formatDateTime(receiptData.end_time)}</div>
+                <div style={{ color: '#059669', fontWeight: 'bold' }}>
+                  <strong>⏰ Toplam Süre:</strong> {formatDuration({ 
+                    duration_minutes: receiptData.receipt?.session_data?.duration_minutes || 0 
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Masa Ücretleri Detayı */}
+            <div style={{
+              backgroundColor: '#fef3c7',
+              padding: '1rem',
+              borderRadius: '0.5rem',
+              marginBottom: '1rem',
+              border: '1px solid #f59e0b'
+            }}>
+              <h4 style={{ margin: '0 0 0.75rem 0', fontWeight: 'bold', color: '#92400e' }}>
+                🎮 Oyun Ücret Hesabı
+              </h4>
+              
+              {/* Açma Ücreti */}
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '0.5rem 0',
+                borderBottom: '1px solid #f59e0b'
+              }}>
+                <div>
+                  <div style={{ fontWeight: 'bold', fontSize: '0.875rem' }}>Masa Açma Ücreti</div>
+                  <div style={{ fontSize: '0.75rem', color: '#6b7280' }}>Sabit ücret</div>
+                </div>
+                <div style={{ fontWeight: 'bold' }}>
+                  {formatAmount(receiptData.receipt?.session_data?.opening_fee || 0)}
+                </div>
+              </div>
+
+              {/* Süre Ücreti */}
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '0.5rem 0',
+                borderBottom: '1px solid #f59e0b'
+              }}>
+                <div>
+                  <div style={{ fontWeight: 'bold', fontSize: '0.875rem' }}>Oyun Süresi Ücreti</div>
+                  <div style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                    {formatDuration({ 
+                      duration_minutes: receiptData.receipt?.session_data?.duration_minutes || 0 
+                    })} × {formatAmount(receiptData.receipt?.session_data?.hourly_rate || 0)}/saat
+                  </div>
+                </div>
+                <div style={{ fontWeight: 'bold' }}>
+                  {formatAmount(
+                    Math.max(0, (receiptData.receipt?.session_data?.gaming_amount || 0) - 
+                            (receiptData.receipt?.session_data?.opening_fee || 0))
+                  )}
+                </div>
+              </div>
+
+              {/* Oyun Toplamı */}
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '0.75rem 0',
+                fontWeight: 'bold',
+                fontSize: '1rem',
+                color: '#92400e'
+              }}>
+                <span>🎮 Oyun Toplamı:</span>
+                <span>{formatAmount(receiptData.receipt?.session_data?.gaming_amount || 0)}</span>
+              </div>
+            </div>
+
+            {/* Ürün Listesi */}
+            {(() => {
+              const products = receiptData.receipt?.session_data?.products || [];
+              
+              return products.length > 0 ? (
+                <div style={{
+                  backgroundColor: '#f0f9ff',
+                  padding: '1rem',
+                  borderRadius: '0.5rem',
+                  marginBottom: '1rem',
+                  border: '1px solid #0ea5e9'
+                }}>
+                  <h4 style={{ margin: '0 0 1rem 0', fontWeight: 'bold', color: '#0c4a6e' }}>
+                    🛒 Satın Alınan Ürünler
+                  </h4>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {products.map((product, index) => (
+                      <div
+                        key={index}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          padding: '0.75rem',
+                          backgroundColor: 'white',
+                          borderRadius: '0.25rem',
+                          border: '1px solid #e0f2fe'
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontWeight: 'bold', fontSize: '0.9rem' }}>
+                            {product.product_name || product.name || 'Ürün'}
+                          </div>
+                          <div style={{ fontSize: '0.8rem', color: '#6b7280' }}>
+                            {product.quantity || 1} adet × {formatAmount(product.unit_price || product.price || 0)}
+                          </div>
+                        </div>
+                        <div style={{ fontWeight: 'bold', color: '#0c4a6e' }}>
+                          {formatAmount(
+                            product.total_price || 
+                            ((product.quantity || 1) * (product.unit_price || product.price || 0))
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{
+                    marginTop: '0.75rem',
+                    paddingTop: '0.75rem',
+                    borderTop: '1px solid #bae6fd',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    fontWeight: 'bold',
+                    color: '#0c4a6e'
+                  }}>
+                    <span>🛒 Ürün Toplamı:</span>
+                    <span>{formatAmount(receiptData.receipt?.session_data?.products_amount || 0)}</span>
+                  </div>
+                </div>
+              ) : (
+                <div style={{
+                  backgroundColor: '#f9fafb',
+                  padding: '1rem',
+                  borderRadius: '0.5rem',
+                  marginBottom: '1rem',
+                  textAlign: 'center',
+                  color: '#6b7280',
+                  fontStyle: 'italic'
+                }}>
+                  Bu seansta ürün satın alınmamıştır.
+                </div>
+              );
+            })()}
+
+            {/* Genel Toplam */}
+            <div style={{
+              backgroundColor: '#dcfce7',
+              padding: '1.5rem',
+              borderRadius: '0.5rem',
+              border: '2px solid #16a34a',
+              marginBottom: '1.5rem'
+            }}>
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center'
+              }}>
+                <div style={{ fontSize: '1.25rem', fontWeight: 'bold', color: '#15803d' }}>
+                  💰 ÖDENECEKBu TUTAR
+                </div>
+                <div style={{ fontSize: '1.75rem', fontWeight: 'bold', color: '#16a34a' }}>
+                  {formatAmount(receiptData.receipt?.session_data?.total_amount || 0)}
+                </div>
+              </div>
+              <div style={{ 
+                fontSize: '0.875rem', 
+                color: '#15803d', 
+                marginTop: '0.5rem',
+                textAlign: 'center',
+                fontWeight: 'bold'
+              }}>
+                Oyun: {formatAmount(receiptData.receipt?.session_data?.gaming_amount || 0)} + 
+                Ürün: {formatAmount(receiptData.receipt?.session_data?.products_amount || 0)}
+              </div>
+            </div>
+
+            {/* Kapatma Butonu */}
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
+              <button
+                onClick={() => {
+                  closeDialog();
+                  // 1 saniye sonra reset dialogunu aç
+                  setTimeout(() => {
+                    openDialog('reset', dialog.tableId);
+                  }, 1000);
+                }}
+                style={{
+                  padding: '0.75rem 2rem',
+                  border: 'none',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#16a34a',
+                  color: 'white',
+                  cursor: 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '1rem'
+                }}
+              >
+                ✅ Tamam
+              </button>
+              <button
+                onClick={() => window.print()}
+                style={{
+                  padding: '0.75rem 2rem',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '0.5rem',
+                  backgroundColor: 'white',
+                  color: '#374151',
+                  cursor: 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '1rem'
+                }}
+              >
+                🖨️ Yazdır
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset Dialog */}
+      {dialog.open && dialog.type === 'reset' && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '0.75rem',
+            padding: '2rem',
+            maxWidth: '500px',
+            width: '90%'
+          }}>
+            <h3 style={{ margin: '0 0 1rem 0', fontSize: '1.25rem', fontWeight: 'bold' }}>
+              🔄 Masa Resetle
+            </h3>
+            <div style={{
+              backgroundColor: '#fef3c7',
+              border: '1px solid #f59e0b',
+              color: '#92400e',
+              padding: '1rem',
+              borderRadius: '0.5rem',
+              marginBottom: '1rem'
+            }}>
+              Bu işlem masayı tamamen sıfırlar. Emin misiniz?
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
+              <button
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '0.5rem',
+                  backgroundColor: 'white',
+                  cursor: 'pointer'
+                }}
+                onClick={closeDialog}
+              >
+                İptal
+              </button>
+              <button
+                style={{
+                  padding: '0.5rem 1rem',
+                  border: 'none',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#ef4444',
+                  color: 'white',
+                  cursor: 'pointer'
+                }}
+                onClick={resetTable}
+              >
+                Resetle
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 };
 
 export default Dashboard;
