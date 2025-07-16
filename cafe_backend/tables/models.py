@@ -1,3 +1,4 @@
+# tables/models.py - TAM DOSYA
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -365,3 +366,89 @@ class PlayStationDevice(models.Model):
     
     def __str__(self):
         return f"{self.table.name} - {self.device_type}"
+
+class EmailSetting(models.Model):
+    """E-posta ayarları"""
+    name = models.CharField(max_length=100, verbose_name='Ayar Adı')
+    is_active = models.BooleanField(default=True, verbose_name='Aktif')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name = 'E-posta Ayarı'
+        verbose_name_plural = 'E-posta Ayarları'
+    
+    def __str__(self):
+        return self.name
+
+class EmailRecipient(models.Model):
+    """E-posta alıcıları"""
+    RECIPIENT_TYPES = [
+        ('daily_report', 'Günlük Rapor'),
+        ('receipt_copy', 'Fiş Kopyası'),
+        ('low_stock_alert', 'Düşük Stok Uyarısı'),
+    ]
+    
+    email_setting = models.ForeignKey(EmailSetting, on_delete=models.CASCADE, related_name='recipients')
+    email = models.EmailField(verbose_name='E-posta Adresi')
+    name = models.CharField(max_length=100, verbose_name='Ad Soyad')
+    recipient_type = models.CharField(max_length=20, choices=RECIPIENT_TYPES, verbose_name='Rapor Türü')
+    is_active = models.BooleanField(default=True, verbose_name='Aktif')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name = 'E-posta Alıcısı'
+        verbose_name_plural = 'E-posta Alıcıları'
+    
+    def __str__(self):
+        return f"{self.name} ({self.email})"
+
+class EmailLog(models.Model):
+    """E-posta logları"""
+    EMAIL_TYPES = [
+        ('daily_report', 'Günlük Rapor'),
+        ('receipt_copy', 'Fiş Kopyası'),
+        ('low_stock_alert', 'Düşük Stok Uyarısı'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('sent', 'Gönderildi'),
+        ('failed', 'Başarısız'),
+    ]
+    
+    email_type = models.CharField(max_length=20, choices=EMAIL_TYPES)
+    recipients = models.TextField()
+    subject = models.CharField(max_length=200)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name = 'E-posta Log'
+        verbose_name_plural = 'E-posta Logları'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.get_email_type_display()} - {self.created_at.strftime('%d.%m.%Y')}"
+
+class DailyReport(models.Model):
+    """Günlük raporlar"""
+    report_date = models.DateField(unique=True, verbose_name='Rapor Tarihi')
+    total_receipts = models.IntegerField(default=0, verbose_name='Toplam Fiş')
+    total_revenue = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name='Toplam Gelir')
+    gaming_revenue = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name='Oyun Geliri')
+    products_revenue = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name='Ürün Geliri')
+    total_sessions = models.IntegerField(default=0, verbose_name='Toplam Seans')
+    avg_session_duration = models.IntegerField(default=0, verbose_name='Ortalama Seans Süresi (dk)')
+    email_sent = models.BooleanField(default=False, verbose_name='E-posta Gönderildi')
+    email_sent_at = models.DateTimeField(null=True, blank=True, verbose_name='E-posta Gönderilme Zamanı')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Günlük Rapor'
+        verbose_name_plural = 'Günlük Raporlar'
+        ordering = ['-report_date']
+    
+    def __str__(self):
+        return f"Günlük Rapor - {self.report_date.strftime('%d.%m.%Y')}"

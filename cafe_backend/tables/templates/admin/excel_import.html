@@ -1,0 +1,35 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<h1>Excel Import</h1>
+
+{% if messages %}
+    {% for message in messages %}
+        <div style="padding: 10px; margin: 10px 0; background: #d4edda; border: 1px solid #c3e6cb;">
+            {{ message|safe }}
+        </div>
+    {% endfor %}
+{% endif %}
+
+<form method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    
+    <div style="border: 2px dashed #ccc; padding: 30px; text-align: center; margin: 20px 0;">
+        <h3>Excel Dosyası Seç</h3>
+        {{ form.excel_file }}
+    </div>
+    
+    <div style="margin: 20px 0;">
+        <label>{{ form.update_existing }} Mevcut ürünleri güncelle</label><br>
+        <label>{{ form.create_categories }} Yeni kategoriler oluştur</label>
+    </div>
+    
+    <button type="submit" style="padding: 10px 20px; background: #007bff; color: white; border: none;">
+        Import Et
+    </button>
+    
+    <a href="{% url 'admin:product_excel_template' %}" style="padding: 10px 20px; background: #28a745; color: white; text-decoration: none; margin-left: 10px;">
+        Template İndir
+    </a>
+</form>
+{% endblock %}

@@ -1,34 +1,54 @@
 from django.contrib import admin
+from django.urls import path
+from django.shortcuts import render, redirect
+from django.contrib import messages
+from django.http import HttpResponse
+from django.db import transaction
 from django.utils.html import format_html
-from django.db.models import Sum
-from .models import Table, Session, PlayStationDevice, Category, Product, SessionProduct, Receipt, StockMovement
+from django.db.models import Sum, F
+import pandas as pd
+import io
+
+from .models import (
+    Table, Session, PlayStationDevice, Category, Product, 
+    SessionProduct, Receipt, StockMovement, 
+    EmailSetting, EmailRecipient, EmailLog, DailyReport
+)
+from .forms import ExcelUploadForm
+
+try:
+    from cafe_backend.tables.utils.email_utils import EmailService
+except ImportError:
+    EmailService = None
+
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
     list_display = ['name', 'product_count', 'total_stock_value', 'created_at']
     search_fields = ['name']
     ordering = ['name']
-    
+
     def product_count(self, obj):
         return obj.products.count()
     product_count.short_description = 'Ürün Sayısı'
-    
+
     def total_stock_value(self, obj):
-        """Kategorideki toplam stok değeri"""
         total = obj.products.aggregate(
-            total=Sum(models.F('current_stock') * models.F('price'))
+            total=Sum(F('current_stock') * F('price'))
         )['total'] or 0
         return f"₺{total:.2f}"
     total_stock_value.short_description = 'Toplam Stok Değeri'
-
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ['name', 'category', 'price', 'current_stock', 'stock_status_colored', 'min_stock_level', 'is_active', 'created_at']
+    list_display = [
+        'name', 'category', 'price', 'current_stock',
+        'stock_status_colored', 'min_stock_level', 'is_active', 'created_at'
+    ]
     list_filter = ['category', 'is_active', 'created_at']
     search_fields = ['name', 'category__name']
     list_editable = ['price', 'current_stock', 'min_stock_level', 'is_active']
     ordering = ['category__name', 'name']
-    
+
     fieldsets = (
         ('Temel Bilgiler', {
             'fields': ('name', 'category', 'price', 'is_active')
@@ -38,9 +58,8 @@ class ProductAdmin(admin.ModelAdmin):
             'classes': ('wide',)
         }),
     )
-    
+
     def stock_status_colored(self, obj):
-        """Renkli stok durumu"""
         if obj.is_out_of_stock:
             color = 'red'
             icon = '❌'
@@ -50,35 +69,213 @@ class ProductAdmin(admin.ModelAdmin):
         else:
             color = 'green'
             icon = '✅'
-        
         return format_html(
             '<span style="color: {};">{} {}</span>',
             color, icon, obj.stock_status_display
         )
     stock_status_colored.short_description = 'Stok Durumu'
-    
-    actions = ['add_stock', 'remove_stock']
-    
-    def add_stock(self, request, queryset):
-        """Toplu stok ekleme"""
-        # Bu action için custom view yazılabilir
-        self.message_user(request, f"{queryset.count()} ürün için stok ekleme işlemi başlatıldı.")
-    add_stock.short_description = "Seçili ürünlere stok ekle"
-    
-    def remove_stock(self, request, queryset):
-        """Toplu stok çıkarma"""
-        self.message_user(request, f"{queryset.count()} ürün için stok çıkarma işlemi başlatıldı.")
-    remove_stock.short_description = "Seçili ürünlerden stok çıkar"
 
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path('excel-import/', self.admin_site.admin_view(self.excel_import_view), name='product_excel_import'),
+            path('excel-template/', self.admin_site.admin_view(self.excel_template_view), name='product_excel_template'),
+        ]
+        return custom_urls + urls
+
+    def excel_import_view(self, request):
+        if request.method == 'POST':
+            form = ExcelUploadForm(request.POST, request.FILES)
+            if form.is_valid():
+                try:
+                    result = self.process_excel_file(
+                        excel_file=request.FILES['excel_file'],
+                        user=request.user,
+                        update_existing=form.cleaned_data['update_existing'],
+                        create_categories=form.cleaned_data['create_categories']
+                    )
+                    if result['success']:
+                        messages.success(request, format_html(
+                            '✅ <strong>Excel import başarılı!</strong><br>'
+                            '📦 {} yeni ürün<br>'
+                            '🔄 {} ürün güncellendi<br>'
+                            '📊 {} stok hareketi',
+                            result['created_products'],
+                            result['updated_products'],
+                            result['stock_movements']
+                        ))
+                        if result['errors']:
+                            messages.warning(request, format_html(
+                                '⚠️ {} hata oluştu:<br>{}',
+                                len(result['errors']),
+                                '<br>'.join(result['errors'][:5]) +
+                                (f'<br>... ve {len(result["errors"]) - 5} hata daha' if len(result['errors']) > 5 else '')
+                            ))
+                    else:
+                        messages.error(request, f"❌ Hata: {result['error']}")
+                except Exception as e:
+                    messages.error(request, f"❌ İşleme hatası: {str(e)}")
+                return redirect('admin:product_excel_import')
+        else:
+            form = ExcelUploadForm()
+
+        context = {
+            'form': form,
+            'title': 'Excel ile Ürün Import',
+            'opts': self.model._meta,
+            'has_view_permission': True,
+            'stats': {
+                'total_products': Product.objects.count(),
+                'total_categories': Category.objects.count(),
+                'active_products': Product.objects.filter(is_active=True).count(),
+                'low_stock_products': Product.objects.filter(
+                    is_active=True,
+                    current_stock__lte=F('min_stock_level')
+                ).count()
+            }
+        }
+        return render(request, 'admin/excel_import.html', context)
+
+    def excel_template_view(self, request):
+        template_data = {
+            'ürün_adı': ['Cola', 'Cips', 'Su', 'Çikolata', 'Red Bull'],
+            'kategori': ['İçecek', 'Atıştırmalık', 'İçecek', 'Tatlı', 'Enerji'],
+            'fiyat': [8.5, 12, 3, 7.5, 15],
+            'stok_miktarı': [50, 30, 100, 40, 25],
+            'min_stok': [10, 5, 20, 8, 5],
+            'max_stok': [200, 100, 500, 150, 80],
+            'birim': ['adet', 'adet', 'adet', 'adet', 'adet'],
+            'tedarikçi': ['Coca Cola', 'Frito-Lay', 'Nestle', 'Mars', 'Red Bull'],
+            'birim_maliyet': [6.00, 8.5, 2.0, 5.5, 11.0]
+        }
+        df = pd.DataFrame(template_data)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Ürünler')
+            worksheet = writer.sheets['Ürünler']
+            from openpyxl.styles import Font
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+        output.seek(0)
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = 'attachment; filename="urun_template.xlsx"'
+        return response
+    def process_excel_file(self, excel_file, user, update_existing=True, create_categories=True):
+        try:
+            df = pd.read_excel(excel_file, sheet_name=0)
+
+            required_columns = ['ürün_adı', 'kategori', 'fiyat', 'stok_miktarı']
+            missing = [col for col in required_columns if col not in df.columns]
+            if missing:
+                return {'success': False, 'error': f"Eksik sütunlar: {', '.join(missing)}"}
+
+            created_products = 0
+            updated_products = 0
+            stock_movements = 0
+            errors = []
+
+            with transaction.atomic():
+                for index, row in df.iterrows():
+                    try:
+                        product_name = str(row['ürün_adı']).strip()
+                        category_name = str(row['kategori']).strip()
+                        if not product_name or product_name == 'nan':
+                            errors.append(f"{index+2}. satır: Ürün adı boş")
+                            continue
+                        if not category_name or category_name == 'nan':
+                            errors.append(f"{index+2}. satır: Kategori boş")
+                            continue
+
+                        price = float(row['fiyat'])
+                        stock_quantity = int(row['stok_miktarı'])
+                        min_stock = int(row.get('min_stok', 5)) if pd.notna(row.get('min_stok')) else 5
+                        max_stock = int(row.get('max_stok', 100)) if pd.notna(row.get('max_stok')) else 100
+                        stock_unit = str(row.get('birim', 'adet')).strip()
+                        supplier = str(row.get('tedarikçi', '')).strip()
+                        unit_cost = float(row.get('birim_maliyet', price * 0.7))
+
+                        if create_categories:
+                            category, _ = Category.objects.get_or_create(name=category_name)
+                        else:
+                            try:
+                                category = Category.objects.get(name=category_name)
+                            except Category.DoesNotExist:
+                                errors.append(f"{index+2}. satır: Kategori bulunamadı")
+                                continue
+
+                        product, created = Product.objects.get_or_create(
+                            name=product_name,
+                            defaults={
+                                'category': category,
+                                'price': price,
+                                'current_stock': 0,
+                                'min_stock_level': min_stock,
+                                'max_stock_level': max_stock,
+                                'stock_unit': stock_unit,
+                                'is_active': True
+                            }
+                        )
+
+                        if created:
+                            created_products += 1
+                        elif update_existing:
+                            product.category = category
+                            product.price = price
+                            product.min_stock_level = min_stock
+                            product.max_stock_level = max_stock
+                            product.stock_unit = stock_unit
+                            product.save()
+                            updated_products += 1
+
+                        if stock_quantity > 0:
+                            old_stock = product.current_stock
+                            new_stock = old_stock + stock_quantity
+
+                            StockMovement.objects.create(
+                                product=product,
+                                movement_type='in',
+                                quantity=stock_quantity,
+                                old_stock=old_stock,
+                                new_stock=new_stock,
+                                unit_cost=unit_cost,
+                                total_cost=unit_cost * stock_quantity,
+                                supplier=supplier,
+                                notes=f'Excel import - {excel_file.name}',
+                                created_by=user
+                            )
+
+                            product.current_stock = new_stock
+                            product.save()
+                            stock_movements += 1
+
+                    except Exception as e:
+                        errors.append(f"{index+2}. satır: {str(e)}")
+
+            return {
+                'success': True,
+                'created_products': created_products,
+                'updated_products': updated_products,
+                'stock_movements': stock_movements,
+                'errors': errors
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 @admin.register(StockMovement)
 class StockMovementAdmin(admin.ModelAdmin):
-    list_display = ['product', 'movement_type', 'quantity_formatted', 'old_stock', 'new_stock', 'total_cost', 'supplier', 'created_by', 'created_at']
+    list_display = [
+        'product', 'movement_type', 'quantity_formatted',
+        'old_stock', 'new_stock', 'total_cost', 'supplier',
+        'created_by', 'created_at'
+    ]
     list_filter = ['movement_type', 'created_at', 'product__category']
     search_fields = ['product__name', 'supplier', 'notes']
-    # Bu alanları readonly'den çıkardık ki elle girebilesin:
     readonly_fields = ['total_cost', 'session_product', 'created_at']
     ordering = ['-created_at']
-    
+
     fieldsets = (
         ('Hareket Bilgileri', {
             'fields': ('product', 'movement_type', 'quantity', 'old_stock', 'new_stock')
@@ -92,40 +289,28 @@ class StockMovementAdmin(admin.ModelAdmin):
             'classes': ('collapse',)
         }),
     )
-    
+
     def quantity_formatted(self, obj):
-        """Miktarı işaretle birlikte göster"""
         if obj.quantity > 0:
             return format_html('<span style="color: green;">+{}</span>', obj.quantity)
-        else:
-            return format_html('<span style="color: red;">{}</span>', obj.quantity)
+        return format_html('<span style="color: red;">{}</span>', obj.quantity)
     quantity_formatted.short_description = 'Miktar'
-    
+
     def save_model(self, request, obj, form, change):
-        """Stok hareketi kaydedilirken ürün stokunu güncelle"""
-        if not change:  # Yeni kayıt
+        if not change:
             obj.created_by = request.user
             super().save_model(request, obj, form, change)
-            
-            # Ürün stokunu güncelle
             product = obj.product
             product.current_stock = obj.new_stock
             product.save()
         else:
             super().save_model(request, obj, form, change)
-    
-    def has_add_permission(self, request):
-        """Manuel stok hareketi ekleme izni"""
-        return request.user.is_superuser or request.user.is_staff
-    
-    def has_change_permission(self, request, obj=None):
-        """Stok hareketi değiştirme izni yok (güvenlik için)"""
-        return False
-    
-    def has_delete_permission(self, request, obj=None):
-        """Stok hareketi silme izni yok (sadece superuser)"""
-        return request.user.is_superuser
 
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
 @admin.register(Table)
 class TableAdmin(admin.ModelAdmin):
     list_display = ['name', 'status', 'hourly_rate', 'opening_fee', 'playstation_ip', 'current_session_info', 'created_at']
@@ -133,23 +318,21 @@ class TableAdmin(admin.ModelAdmin):
     search_fields = ['name', 'playstation_ip']
     list_editable = ['status', 'hourly_rate', 'opening_fee']
     ordering = ['name']
-    
+
     def current_session_info(self, obj):
         session = obj.current_session
         if session:
             return format_html(
-                '<span style="color: orange;">Aktif - {}dk</span>',
+                '<span style="color: orange;">Aktif - {} dk</span>',
                 session.duration_minutes
             )
         return format_html('<span style="color: green;">Müsait</span>')
     current_session_info.short_description = 'Seans Durumu'
-
 class SessionProductInline(admin.TabularInline):
     model = SessionProduct
     extra = 0
     readonly_fields = ['total_price', 'added_at']
     fields = ['product', 'quantity', 'unit_price', 'total_price', 'added_at']
-
 @admin.register(Session)
 class SessionAdmin(admin.ModelAdmin):
     list_display = ['table', 'user', 'start_time', 'end_time', 'duration_display', 'total_amount', 'is_paid', 'is_reset']
@@ -158,7 +341,7 @@ class SessionAdmin(admin.ModelAdmin):
     readonly_fields = ['duration_minutes', 'current_gaming_amount', 'current_total_amount']
     ordering = ['-start_time']
     inlines = [SessionProductInline]
-    
+
     fieldsets = (
         ('Seans Bilgileri', {
             'fields': ('table', 'user', 'start_time', 'end_time', 'notes')
@@ -172,13 +355,12 @@ class SessionAdmin(admin.ModelAdmin):
         ('Hesaplamalar (Canlı)', {
             'fields': ('duration_minutes', 'current_gaming_amount', 'current_total_amount'),
             'classes': ('collapse',)
-        })
+        }),
     )
-    
+
     def duration_display(self, obj):
         return f"{obj.duration_minutes} dk"
     duration_display.short_description = 'Süre'
-
 @admin.register(SessionProduct)
 class SessionProductAdmin(admin.ModelAdmin):
     list_display = ['session', 'product', 'quantity', 'unit_price', 'total_price', 'stock_effect', 'added_at']
@@ -186,162 +368,21 @@ class SessionProductAdmin(admin.ModelAdmin):
     search_fields = ['session__table__name', 'product__name']
     readonly_fields = ['total_price', 'added_at']
     ordering = ['-added_at']
-    
+
     def stock_effect(self, obj):
-        """Stok etkisi"""
         return format_html(
             '<span style="color: red;">-{} {}</span>',
             obj.quantity, obj.product.stock_unit
         )
     stock_effect.short_description = 'Stok Etkisi'
-
-# Custom tarih filtreleri
-class CustomDateFilter(admin.SimpleListFilter):
-    """Özel tarih filtreleri"""
-    title = 'Kesilme Zamanı'
-    parameter_name = 'custom_date'
-
-    def lookups(self, request, model_admin):
-        return (
-            ('today', 'Bugün'),
-            ('yesterday', 'Dün'), 
-            ('last_7_days', 'Son 7 Gün'),
-            ('last_30_days', 'Son 30 Gün'),
-            ('this_week', 'Bu Hafta'),
-            ('this_month', 'Bu Ay'),
-            ('last_month', 'Geçen Ay'),
-            ('custom_range', 'Tarih Aralığı Gir'),
-        )
-
-    def queryset(self, request, queryset):
-        from django.utils import timezone
-        from datetime import timedelta
-        
-        now = timezone.now()
-        today = now.date()
-        
-        if self.value() == 'today':
-            return queryset.filter(issued_at__date=today)
-        
-        elif self.value() == 'yesterday':
-            yesterday = today - timedelta(days=1)
-            return queryset.filter(issued_at__date=yesterday)
-        
-        elif self.value() == 'last_7_days':
-            start_date = today - timedelta(days=7)
-            return queryset.filter(issued_at__date__gte=start_date)
-        
-        elif self.value() == 'last_30_days':
-            start_date = today - timedelta(days=30)
-            return queryset.filter(issued_at__date__gte=start_date)
-        
-        elif self.value() == 'this_week':
-            start_week = today - timedelta(days=today.weekday())
-            return queryset.filter(issued_at__date__gte=start_week)
-        
-        elif self.value() == 'this_month':
-            start_month = today.replace(day=1)
-            return queryset.filter(issued_at__date__gte=start_month)
-        
-        elif self.value() == 'last_month':
-            # Geçen ayın ilk günü
-            if today.month == 1:
-                last_month_start = today.replace(year=today.year-1, month=12, day=1)
-                last_month_end = today.replace(day=1) - timedelta(days=1)
-            else:
-                last_month_start = today.replace(month=today.month-1, day=1)
-                last_month_end = today.replace(day=1) - timedelta(days=1)
-            
-            return queryset.filter(
-                issued_at__date__gte=last_month_start,
-                issued_at__date__lte=last_month_end
-            )
-        
-        # Manuel tarih aralığı için
-        start_date = request.GET.get('start_date')
-        end_date = request.GET.get('end_date')
-        
-        if start_date and end_date:
-            try:
-                from datetime import datetime
-                start = datetime.strptime(start_date, '%Y-%m-%d').date()
-                end = datetime.strptime(end_date, '%Y-%m-%d').date()
-                return queryset.filter(
-                    issued_at__date__gte=start,
-                    issued_at__date__lte=end
-                )
-            except ValueError:
-                pass
-        
-        return queryset
-
-class ManualDateRangeFilter(admin.SimpleListFilter):
-    """Manuel tarih aralığı filtresi"""
-    title = 'Manuel Tarih Seçimi'
-    parameter_name = 'date_range'
-    template = 'admin/date_range_filter.html'
-
-    def lookups(self, request, model_admin):
-        return (
-            ('custom', 'Tarih Aralığı Belirle'),
-        )
-
-    def choices(self, changelist):
-        # Filtrenin HTML'ini özelleştir
-        for lookup, title in self.lookup_choices:
-            yield {
-                'selected': self.value() == lookup,
-                'query_string': changelist.get_query_string({self.parameter_name: lookup}),
-                'display': title,
-            }
-
-    def queryset(self, request, queryset):
-        start_date = request.GET.get('start_date')
-        end_date = request.GET.get('end_date')
-        
-        if start_date and end_date:
-            try:
-                from datetime import datetime
-                start = datetime.strptime(start_date, '%Y-%m-%d').date()
-                end = datetime.strptime(end_date, '%Y-%m-%d').date()
-                return queryset.filter(
-                    issued_at__date__gte=start,
-                    issued_at__date__lte=end
-                )
-            except ValueError:
-                pass
-        return queryset
-
 @admin.register(Receipt)
 class ReceiptAdmin(admin.ModelAdmin):
     list_display = ['receipt_number', 'session_info', 'total_amount', 'issued_by', 'issued_at']
-    list_filter = [
-        CustomDateFilter,  # Özel tarih filtresi
-        'issued_by',  # Kesen kişi filtresi
-        'session__table',  # Masa filtresi
-    ]
+    list_filter = ['issued_by', 'session__table']
     search_fields = ['receipt_number', 'session__table__name']
     readonly_fields = ['receipt_number', 'issued_at']
     ordering = ['-issued_at']
-    date_hierarchy = 'issued_at'  # Üstte tarih navigasyonu
-    
-    # Manuel tarih aralığı için custom view
-    def changelist_view(self, request, extra_context=None):
-        extra_context = extra_context or {}
-        
-        # Tarih aralığı formu için context
-        extra_context['date_range_form'] = True
-        extra_context['start_date'] = request.GET.get('start_date', '')
-        extra_context['end_date'] = request.GET.get('end_date', '')
-        
-        return super().changelist_view(request, extra_context)
-    
-    class Media:
-        css = {
-            'all': ('admin/css/date_range_filter.css',)
-        }
-        js = ('admin/js/date_range_filter.js',)
-    
+
     fieldsets = (
         ('Fiş Bilgileri', {
             'fields': ('receipt_number', 'session', 'issued_at')
@@ -350,9 +391,8 @@ class ReceiptAdmin(admin.ModelAdmin):
             'fields': ('issued_by',)
         }),
     )
-    
+
     def session_info(self, obj):
-        """Seans bilgilerini göster"""
         session = obj.session
         duration = f"{session.duration_minutes}dk" if session.duration_minutes else "0dk"
         return format_html(
@@ -363,89 +403,49 @@ class ReceiptAdmin(admin.ModelAdmin):
             f"₺{session.products_amount}"
         )
     session_info.short_description = 'Seans Detayı'
-    
+
     def total_amount(self, obj):
         return format_html(
             '<span style="font-weight: bold; color: #16a34a;">₺{}</span>',
             f"{obj.session.total_amount:.2f}"
         )
     total_amount.short_description = 'Toplam Tutar'
-    
-    # Custom actions
-    actions = ['export_selected_report']
-    
-    def export_selected_report(self, request, queryset):
-        """Seçili fişler için rapor"""
-        total = sum(r.session.total_amount for r in queryset)
-        count = queryset.count()
-        
-        # Tarih aralığı bilgisi
-        dates = queryset.aggregate(
-            min_date=models.Min('issued_at'),
-            max_date=models.Max('issued_at')
-        )
-        
-        date_info = ""
-        if dates['min_date'] and dates['max_date']:
-            if dates['min_date'].date() == dates['max_date'].date():
-                date_info = f" ({dates['min_date'].strftime('%d.%m.%Y')})"
-            else:
-                date_info = f" ({dates['min_date'].strftime('%d.%m.%Y')} - {dates['max_date'].strftime('%d.%m.%Y')})"
-        
-        self.message_user(
-            request,
-            f"📊 Rapor{date_info}: {count} fiş, Toplam: ₺{total:.2f}"
-        )
-    export_selected_report.short_description = "📊 Seçili fişler için rapor oluştur"
-
 @admin.register(PlayStationDevice)
 class PlayStationDeviceAdmin(admin.ModelAdmin):
     list_display = ['table', 'device_type', 'mac_address', 'is_online', 'last_seen']
     list_filter = ['device_type', 'is_online']
     search_fields = ['table__name', 'mac_address']
     list_editable = ['is_online']
+@admin.register(EmailSetting)
+class EmailSettingAdmin(admin.ModelAdmin):
+    list_display = ['name', 'is_active', 'recipient_count', 'created_at']
+    list_filter = ['is_active', 'created_at']
+    search_fields = ['name']
 
-# Admin Dashboard için özel görünümler
-class StockLevelFilter(admin.SimpleListFilter):
-    """Stok seviyesine göre filtreleme"""
-    title = 'Stok Seviyesi'
-    parameter_name = 'stock_level'
+    def recipient_count(self, obj):
+        return obj.recipients.filter(is_active=True).count()
+    recipient_count.short_description = 'Aktif Alıcı Sayısı'
 
-    def lookups(self, request, model_admin):
-        return (
-            ('out', 'Stok Tükendi'),
-            ('low', 'Stok Azalıyor'),
-            ('normal', 'Stok Normal'),
-        )
 
-    def queryset(self, request, queryset):
-        if self.value() == 'out':
-            return queryset.filter(current_stock=0)
-        if self.value() == 'low':
-            return queryset.filter(current_stock__gt=0, current_stock__lte=models.F('min_stock_level'))
-        if self.value() == 'normal':
-            return queryset.filter(current_stock__gt=models.F('min_stock_level'))
+@admin.register(EmailRecipient)
+class EmailRecipientAdmin(admin.ModelAdmin):
+    list_display = ['name', 'email', 'recipient_type', 'is_active', 'created_at']
+    list_filter = ['recipient_type', 'is_active', 'created_at']
+    search_fields = ['name', 'email']
+    list_editable = ['is_active']
+    ordering = ['recipient_type', 'name']
 
-# ProductAdmin'e stok filtresi ekle
-ProductAdmin.list_filter = ['category', 'is_active', StockLevelFilter, 'created_at']
 
-# Custom admin actions
-@admin.action(description='Stok raporu oluştur')
-def generate_stock_report(modeladmin, request, queryset):
-    """Seçili ürünler için stok raporu oluştur"""
-    # Bu daha sonra PDF/Excel raporu olarak geliştirilebilir
-    total_value = 0
-    low_stock_count = 0
-    
-    for product in queryset:
-        total_value += product.current_stock * product.price
-        if product.is_low_stock:
-            low_stock_count += 1
-    
-    modeladmin.message_user(
-        request, 
-        f"Rapor: {queryset.count()} ürün, Toplam değer: ₺{total_value:.2f}, Düşük stok: {low_stock_count} ürün"
-    )
+@admin.register(EmailLog)
+class EmailLogAdmin(admin.ModelAdmin):
+    list_display = ['email_type', 'status', 'sent_at', 'created_at']
+    list_filter = ['email_type', 'status', 'sent_at']
+    readonly_fields = ['email_type', 'recipients', 'subject', 'sent_at', 'created_at']
+    ordering = ['-created_at']
 
-# ProductAdmin'e action ekle
-ProductAdmin.actions.append(generate_stock_report)
+
+@admin.register(DailyReport)
+class DailyReportAdmin(admin.ModelAdmin):
+    list_display = ['report_date', 'total_receipts', 'total_revenue', 'email_sent']
+    list_filter = ['report_date', 'email_sent']
+    ordering = ['-report_date']
